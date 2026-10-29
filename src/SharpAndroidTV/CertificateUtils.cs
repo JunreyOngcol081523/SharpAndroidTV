@@ -1,4 +1,4 @@
-﻿using Org.BouncyCastle.Asn1.X509;
+using Org.BouncyCastle.Asn1.X509;
 using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Operators;
 using Org.BouncyCastle.Crypto.Prng;
@@ -148,28 +148,39 @@ namespace AndroidTVAPI
             }
         }
 
-        private static X509Certificate2 GetX509CertificateWithPrivateKey(Org.BouncyCastle.X509.X509Certificate bouncyCastleCert, AsymmetricKeyParameter privateKey)
+        private static X509Certificate2 GetX509CertificateWithPrivateKey(
+            Org.BouncyCastle.X509.X509Certificate bouncyCastleCert,
+            AsymmetricKeyParameter privateKey)
         {
-            // this workaround is needed to fill in the Private Key in the X509Certificate2
-            string alias = bouncyCastleCert.SubjectDN.ToString();
-            Pkcs12Store store = new Pkcs12StoreBuilder().Build();
+            // The original implementation round-tripped through a BouncyCastle PKCS#12 store,
+            // which encrypts with RC2 by default. RC2 is not supported on Android, so instead
+            // we load the certificate from its DER bytes and attach the RSA key directly.
 
-            X509CertificateEntry certEntry = new X509CertificateEntry(bouncyCastleCert);
-            store.SetCertificateEntry(alias, certEntry);
+            var cert = new X509Certificate2(bouncyCastleCert.GetEncoded());
 
-            AsymmetricKeyEntry keyEntry = new AsymmetricKeyEntry(privateKey);
-            store.SetKeyEntry(alias, keyEntry, new X509CertificateEntry[] { certEntry });
+            // Convert the BouncyCastle RSA private key to .NET RSA parameters
+            var rsaKey = (Org.BouncyCastle.Crypto.Parameters.RsaPrivateCrtKeyParameters)privateKey;
+            var rsaParams = DotNetUtilities.ToRSAParameters(rsaKey);
 
-            byte[] certificateData;
-            string password = Guid.NewGuid().ToString();
-            using (MemoryStream memoryStream = new MemoryStream())
+            // Not disposed on purpose: the returned certificate keeps using this key.
+            var rsa = System.Security.Cryptography.RSA.Create();
+            rsa.ImportParameters(rsaParams);
+
+            var withKey = cert.CopyWithPrivateKey(rsa);
+
+            try
             {
-                store.Save(memoryStream, password.ToCharArray(), new SecureRandom());
-                memoryStream.Flush();
-                certificateData = memoryStream.ToArray();
+                // Re-export with .NET's own (modern) PKCS#12 encryption and reload. This makes
+                // the certificate behave like a normally loaded one on Android's TLS stack.
+                string password = Guid.NewGuid().ToString();
+                byte[] pfx = withKey.Export(X509ContentType.Pfx, password);
+                return new X509Certificate2(pfx, password, X509KeyStorageFlags.Exportable);
             }
-
-            return new X509Certificate2(certificateData, password, X509KeyStorageFlags.Exportable);
+            catch
+            {
+                // If the re-export isn't supported on this platform, use the cert as-is.
+                return withKey;
+            }
         }
     }
 }
